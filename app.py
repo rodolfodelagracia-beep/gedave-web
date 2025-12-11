@@ -3,6 +3,7 @@ import pandas as pd
 import sqlite3
 from datetime import date, datetime, timedelta
 import random
+import os
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Gestão de Rebanho GEDAVE", layout="wide", page_icon="🐄")
@@ -38,11 +39,16 @@ def seed_db():
     if os.path.exists(DB_FILE):
         conn = get_connection()
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM animais")
-        count = c.fetchone()[0]
-        conn.close()
-        if count > 0:
-            return  # Já tem dados
+        try:
+            c.execute("SELECT COUNT(*) FROM animais")
+            count = c.fetchone()[0]
+            if count > 0:
+                conn.close()
+                return  # Já tem dados
+        except:
+            pass # Tabela pode não existir ainda
+        finally:
+             if conn: conn.close()
 
     # Gerar dados
     conn = get_connection()
@@ -52,7 +58,6 @@ def seed_db():
     hoje = date.today()
     
     # Estratégia de Seed para cobrir todas as faixas do GEDAVE
-    # 0-2m, 3-8m, 9-12m, 13-24m, 25-36m, >36m
     offsets = [
         30,      # ~1 mês (0-2)
         120,     # ~4 meses (3-8) -> Fêmea aqui é CRÍTICA para Brucelose
@@ -80,20 +85,18 @@ def seed_db():
             brinco = f"TESTE-{i}-{k}-{random.randint(100,999)}"
             animais_fake.append((brinco, nasc, sexo, hoje, 'Ativo', vacinada))
 
-    c.executemany("INSERT INTO animais (brinco, data_nascimento, sexo, data_entrada, status, vacinada_brucelose) VALUES (?, ?, ?, ?, ?, ?)", animais_fake)
-    conn.commit()
-    conn.close()
-    st.toast("Banco de dados populado com dados de teste!", icon="✅")
+    try:
+        c.executemany("INSERT INTO animais (brinco, data_nascimento, sexo, data_entrada, status, vacinada_brucelose) VALUES (?, ?, ?, ?, ?, ?)", animais_fake)
+        conn.commit()
+        st.toast("Banco de dados populado com dados de teste!", icon="✅")
+    except Exception as e:
+        pass # Ignora erro se já existir (duplicação)
+    finally:
+        conn.close()
 
-import os
 # --- INICIALIZAÇÃO ---
-if not os.path.exists(DB_FILE):
-    init_db()
-    seed_db()
-else:
-    # Garantir que tabelas existam mesmo se arquivo existir vazio
-    init_db()
-    seed_db() # Verifica se está vazio dentro da função
+init_db()
+seed_db()
 
 # --- FUNÇÕES DE NEGÓCIO ---
 
@@ -103,7 +106,6 @@ def calcular_idade_meses(data_nasc, data_ref):
         data_nasc = datetime.strptime(data_nasc, "%Y-%m-%d").date()
     
     # Diferença em meses (aproximação precisa o suficiente para GEDAVE)
-    # GEDAVE considera meses completos
     delta = data_ref.year * 12 + data_ref.month - (data_nasc.year * 12 + data_nasc.month)
     
     # Ajuste fino: se o dia de referência for menor que o dia de nascimento, ainda não completou o mês
@@ -136,8 +138,11 @@ with st.sidebar:
     st.markdown("---")
     if st.button("Resetar Banco de Dados (Apagar Tudo)"):
         if os.path.exists(DB_FILE):
-            os.remove(DB_FILE)
-            st.rerun()
+            try:
+                os.remove(DB_FILE)
+                st.rerun()
+            except:
+                st.error("Erro ao apagar arquivo. Tente reiniciar a aplicação.")
 
 # Abas
 tab1, tab2 = st.tabs(["📝 Cadastro e Movimentação", "📊 Painel GEDAVE"])
@@ -148,6 +153,7 @@ with tab1:
     
     with col1:
         st.subheader("Novo Animal")
+        # --- FORMULÁRIO (INDENTADO) ---
         with st.form("form_animal"):
             brinco_input = st.text_input("Brinco (ID)")
             nasc_input = st.date_input("Data Nascimento")
@@ -170,21 +176,30 @@ with tab1:
                     st.error("Erro: Brinco já existe!")
                 finally:
                     conn.close()
-            
-            st.divider()
-            
-            # --- CÓDIGO NOVO PARA EXCLUIR ---
-            with st.expander("🗑️ Zona de Perigo (Excluir Animal por Erro)"):
-                brinco_del = st.text_input("Digite o Brinco exato para excluir")
-                if st.button("Excluir Definitivamente"):
-                    if brinco_del:
-                        conn = get_connection()
-                        conn.execute("DELETE FROM animais WHERE brinco = ?", (brinco_del,))
-                        conn.commit()
+        # --- FIM DO FORMULÁRIO ---
+        
+        st.divider()
+        
+        # --- ZONA DE PERIGO (FORA DO FORMULÁRIO - CORRIGIDO) ---
+        with st.expander("🗑️ Zona de Perigo (Excluir Animal)"):
+            brinco_del = st.text_input("Digite o Brinco para excluir")
+            if st.button("Excluir Definitivamente"):
+                if brinco_del:
+                    conn = get_connection()
+                    try:
+                        c = conn.cursor()
+                        c.execute("DELETE FROM animais WHERE brinco = ?", (brinco_del,))
+                        if c.rowcount > 0:
+                            conn.commit()
+                            st.warning(f"Animal {brinco_del} foi apagado!")
+                            # Pequeno delay ou rerun direto
+                            st.rerun()
+                        else:
+                            st.error("Brinco não encontrado.")
+                    except Exception as e:
+                        st.error(f"Erro: {e}")
+                    finally:
                         conn.close()
-                        st.warning(f"Animal {brinco_del} foi apagado do banco de dados!")
-                        st.rerun()
-            # -------------------------------
 
     with col2:
         st.subheader("Animais Ativos")
@@ -205,14 +220,8 @@ with tab1:
                 key="editor_animais"
             )
             
-            # Detectar mudanças e salvar (implementação simplificada via botão de atualizar para garantir integridade)
-            # O st.data_editor retorna o DF editado. Para salvar no DB, precisamos iterar.
-            # Como é SQLite local, podemos fazer um botão "Salvar Alterações da Tabela"
-            
             if st.button("💾 Salvar Alterações na Tabela"):
                 conn = get_connection()
-                # Atualizando registros modificados
-                # Para simplificar, vou iterar e atualizar tudo (viável para <1000 animais, idealmente faria diff)
                 for index, row in edited_df.iterrows():
                     conn.execute("""
                         UPDATE animais 
@@ -244,7 +253,6 @@ with tab2:
         df['Sexo_Label'] = df['sexo'].map(SEXO_MAP)
         
         # 3. Pivot Table (Tabela Cruzada)
-        # Ordem fixa das colunas para seguir padrão GEDAVE
         faixas_ordem = [
             "00 a 02 meses", "03 a 08 meses", "09 a 12 meses", 
             "13 a 24 meses", "25 a 36 meses", "Acima de 36 meses"
@@ -255,22 +263,18 @@ with tab2:
             columns=df['Faixa Etária']
         )
         
-        # Reindexar para garantir que todas as colunas apareçam mesmo se zeradas
         pivot = pivot.reindex(columns=faixas_ordem, fill_value=0)
         
         st.subheader("1. Saldo de Rebanho (Por Faixa Etária e Sexo)")
         st.dataframe(pivot, use_container_width=True)
         
-        # Totais
         total_animais = len(df)
         st.metric("Total de Cabeças", total_animais)
 
         st.divider()
 
-        # 4. Brucelose (Apenas Fêmeas 3 a 8 meses)
         st.subheader("2. Controle de Brucelose (Fêmeas 03 a 08 meses)")
         
-        # Filtro
         femeas_brucelose = df[
             (df['sexo'] == 'F') & 
             (df['meses_idade'] >= 3) & 
@@ -288,7 +292,6 @@ with tab2:
                 st.dataframe(stats_brucelose)
             
             with col_b2:
-                # Alerta de Não Vacinadas
                 nao_vacinadas = femeas_brucelose[femeas_brucelose['vacinada_brucelose'] == 0]
                 count_nao = len(nao_vacinadas)
                 
