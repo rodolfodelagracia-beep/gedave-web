@@ -174,7 +174,6 @@ def _migrate_legacy_to_v2(conn: sqlite3.Connection) -> None:
     """
     # Detecta colunas do legacy
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(animais)").fetchall()]
-    has_data_ref = "data_referencia" in cols
     has_vac = "vacinada_brucelose" in cols
 
     # Cria tabelas novas (temporárias)
@@ -737,4 +736,180 @@ with tab1:
                 except sqlite3.IntegrityError:
                     st.error("Brinco já existe. Use um brinco único.")
                 except Exception as e:
-                    s
+                    st.error(f"Erro ao salvar: {e}")
+
+    # ------- Lista rápida (Feedback visual) -------
+    with colB:
+        st.write("### Últimas movimentações")
+        # Carrega apenas para visualização rápida
+        try:
+            with db() as conn:
+                ultimos = pd.read_sql_query("""
+                    SELECT a.brinco, m.tipo, m.data_evento 
+                    FROM movimentacoes m
+                    JOIN animais a ON a.id = m.animal_id
+                    ORDER BY m.id DESC LIMIT 5
+                """, conn)
+            if not ultimos.empty:
+                st.dataframe(ultimos, use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhuma movimentação registrada ainda.")
+        except Exception:
+            st.error("Erro ao ler movimentações recentes.")
+
+# =========================
+# TAB 2: PAINEL E RELATÓRIOS
+# =========================
+with tab2:
+    st.header("Gerenciamento do Rebanho")
+    
+    # Carrega dados
+    df_animais = load_animais(st.session_state["cache_buster"])
+    
+    if df_animais.empty:
+        st.warning("Nenhum animal cadastrado.")
+    else:
+        # Filtros rápidos
+        col_f1, col_f2, col_f3 = st.columns(3)
+        filtro_status = col_f1.multiselect("Filtrar Status", STATUS_OPCOES, default=["Ativo"])
+        filtro_brinco = col_f2.text_input("Buscar Brinco")
+        
+        # Aplica filtros
+        mask = df_animais["status"].isin(filtro_status)
+        if filtro_brinco:
+            mask = mask & df_animais["brinco"].astype(str).str.contains(filtro_brinco.upper())
+        
+        df_view = df_animais[mask].copy()
+        
+        # Estatísticas Rápidas
+        total = len(df_view)
+        machos = len(df_view[df_view["sexo"] == "M"])
+        femeas = len(df_view[df_view["sexo"] == "F"])
+        
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total Listado", total)
+        k2.metric("Machos", machos)
+        k3.metric("Fêmeas", femeas)
+        
+        st.divider()
+        
+        # --- EDITOR DE DADOS (Edição em massa) ---
+        st.subheader("Edição Rápida (Status / Vacina)")
+        st.caption("Altere 'Status' ou 'Vacinada' diretamente na tabela abaixo.")
+        
+        # Configura colunas para o st.data_editor
+        edited_df = st.data_editor(
+            df_view,
+            column_config={
+                "id": None, # Esconde ID
+                "brinco": st.column_config.TextColumn("Brinco", disabled=True),
+                "data_nascimento": st.column_config.DateColumn("Nascimento", disabled=True, format="DD/MM/YYYY"),
+                "sexo": st.column_config.TextColumn("Sexo", disabled=True),
+                "data_entrada": st.column_config.DateColumn("Entrada", disabled=True, format="DD/MM/YYYY"),
+                "status": st.column_config.SelectboxColumn("Status", options=STATUS_OPCOES, required=True),
+                "vacinada_brucelose": st.column_config.CheckboxColumn("Vac. Brucelose", default=False),
+                "data_vacina_brucelose": st.column_config.DateColumn("Data Vacina", format="DD/MM/YYYY"),
+                "created_at": None,
+                "updated_at": None
+            },
+            hide_index=True,
+            use_container_width=True,
+            key="editor_animais"
+        )
+        
+        # Botão para salvar edições
+        if st.button("Salvar Alterações da Tabela"):
+            changes = update_animais_from_editor(df_view, edited_df)
+            if changes > 0:
+                st.success(f"{changes} animais atualizados com sucesso!")
+                st.rerun()
+            else:
+                st.info("Nenhuma alteração detectada para salvar.")
+
+        st.divider()
+
+        # --- GERAÇÃO DE PDF (GEDAVE) ---
+        st.subheader("📄 Declaração de Rebanho")
+        
+        # Prepara dados para o PDF (apenas Ativos para o saldo oficial)
+        df_ativos_pdf = df_animais[df_animais["status"] == "Ativo"].copy()
+        pivot_table, femeas_pendentes, nao_vac, _ = build_declaracao_frames(df_ativos_pdf, data_referencia)
+        
+        col_pdf, col_csv = st.columns(2)
+        
+        with col_pdf:
+            if st.button("Gerar PDF para Impressão"):
+                try:
+                    pdf_bytes = make_declaracao_pdf(
+                        pivot_table, 
+                        nao_vac, 
+                        len(df_ativos_pdf), 
+                        data_referencia
+                    )
+                    st.download_button(
+                        label="⬇️ Baixar PDF (Declaração)",
+                        data=pdf_bytes,
+                        file_name=f"gedave_rebanho_{date.today()}.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"Erro ao gerar PDF: {e}")
+                    logging.exception("PDF Error")
+        
+        with col_csv:
+            csv_data = df_to_csv_bytes(df_view)
+            st.download_button(
+                label="⬇️ Baixar CSV (Dados Atuais)",
+                data=csv_data,
+                file_name="animais_export.csv",
+                mime="text/csv"
+            )
+
+# =========================
+# TAB 3: HISTÓRICO
+# =========================
+with tab3:
+    st.header("Histórico Individual")
+    
+    # Selectbox para escolher animal
+    df_animais = load_animais(st.session_state["cache_buster"])
+    if df_animais.empty:
+        st.info("Sem dados.")
+    else:
+        lista_animais = df_animais["brinco"].unique().tolist()
+        lista_animais.sort()
+        
+        escolha = st.selectbox("Selecione o Brinco:", lista_animais)
+        
+        if escolha:
+            # Pega ID
+            animal_row = df_animais[df_animais["brinco"] == escolha].iloc[0]
+            animal_id = int(animal_row["id"])
+            
+            # Mostra detalhes
+            st.write(f"**Detalhes de {escolha}**")
+            st.json({
+                "Nascimento": str(animal_row["data_nascimento"]),
+                "Sexo": animal_row["sexo"],
+                "Status Atual": animal_row["status"],
+                "Brucelose": "Sim" if animal_row["vacinada_brucelose"] else "Não"
+            })
+            
+            st.subheader("Histórico de Movimentações")
+            df_mov = load_movimentacoes(st.session_state["cache_buster"], animal_id)
+            
+            if not df_mov.empty:
+                # Formata tabela
+                df_show = df_mov[["data_evento", "tipo", "observacao"]].copy()
+                df_show["data_evento"] = pd.to_datetime(df_show["data_evento"]).dt.strftime('%d/%m/%Y')
+                st.dataframe(df_show, use_container_width=True, hide_index=True)
+                
+                # Botão de Excluir Animal (Perigoso)
+                st.divider()
+                with st.expander("Zona de Perigo"):
+                    if st.button(f"Excluir Definitivamente o animal {escolha}"):
+                        hard_delete_animal(escolha)
+                        st.success("Animal excluído.")
+                        st.rerun()
+            else:
+                st.info("Sem movimentações registradas.")
